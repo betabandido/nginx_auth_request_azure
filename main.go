@@ -10,17 +10,42 @@ import (
 
 func main() {
 	flagSet := flag.NewFlagSet("nginx_auth_request_azure", flag.ExitOnError)
-	tenantId := flagSet.String("tenant-id", "", "Tenant Id")
-	clientId := flagSet.String("client-id", os.Getenv("NGINX_AUTH_AZURE_CLIENT_ID"), "Client Id")
-	callbackUrl := flagSet.String("callback-url", "", "Callback URL")
-	address := flagSet.String("address", ":4180", "Address to listen on")
+
+	tenantId := flagSet.String(
+		"tenant-id",
+		"",
+		"Tenant Id")
+
+	clientId := flagSet.String(
+		"client-id",
+		os.Getenv("NGINX_AUTH_AZURE_CLIENT_ID"),
+		"Client Id",
+	)
+
+	clientSecret := flagSet.String(
+		"client-secret",
+		os.Getenv("NGINX_AUTH_AZURE_CLIENT_SECRET"),
+		"Client Secret",
+	)
+
+	callbackUrl := flagSet.String(
+		"callback-url",
+		"",
+		"Callback URL",
+	)
+
+	address := flagSet.String(
+		"address",
+		":4180",
+		"Address to listen on",
+	)
 
 	err := flagSet.Parse(os.Args[1:])
 	if err != nil {
 		panic(err)
 	}
 
-	if *tenantId == "" || *clientId == "" || *callbackUrl == "" {
+	if *tenantId == "" || *clientId == "" || *clientSecret == "" || *callbackUrl == "" {
 		flagSet.Usage()
 		os.Exit(1)
 	}
@@ -30,6 +55,11 @@ func main() {
 		*clientId,
 		*callbackUrl,
 	)
+	//handler, err := auth.NewGoogleAuthenticationHandler(
+	//	*clientId,
+	//	*clientSecret,
+	//	*callbackUrl,
+	//)
 	if err != nil {
 		panic(err)
 	}
