@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/coreos/go-oidc"
 	"github.com/google/uuid"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 type signInPageData struct {
@@ -19,10 +21,12 @@ type signInPageData struct {
 type AzureAuthenticationHandler struct {
 	tenantId string
 	clientId string
+	clientSecret string
 	callbackUrl string
 	oidcProvider *oidc.Provider
 	tokenVerifier *oidc.IDTokenVerifier
 	userTokens map[string]string
+	httpClient http.Client
 }
 
 const signInTemplateContent = `
@@ -37,7 +41,7 @@ var signInTemplate = template.Must(
 
 func issuerUrl(tenantId string) string {
 	return fmt.Sprintf(
-		"https://login.microsoftonline.com/%s/v2.0",
+		"https://sts.windows.net/%s/",
 		tenantId,
 	)
 }
@@ -45,6 +49,7 @@ func issuerUrl(tenantId string) string {
 func NewAzureAuthenticationHandler(
 	tenantId string,
 	clientId string,
+	clientSecret string,
 	callbackUrl string,
 ) (*AzureAuthenticationHandler, error) {
 	provider, err := oidc.NewProvider(context.Background(), issuerUrl(tenantId))
@@ -55,10 +60,14 @@ func NewAzureAuthenticationHandler(
 	handler := &AzureAuthenticationHandler{
 		tenantId: tenantId,
 		clientId: clientId,
+		clientSecret: clientSecret,
 		callbackUrl: callbackUrl,
 		oidcProvider: provider,
 		tokenVerifier: provider.Verifier(&oidc.Config{ClientID: clientId}),
 		userTokens: make(map[string]string),
+		httpClient: http.Client{
+			Timeout: time.Second * 10,
+		},
 	}
 
 	return handler, nil
@@ -99,12 +108,13 @@ func (h *AzureAuthenticationHandler) HandleAuthStart(writer http.ResponseWriter,
 
 	q := authUrl.Query()
 	q.Add("client_id", h.clientId)
-	q.Add("response_type", "id_token")
+	q.Add("response_type", "code")
 	q.Add("redirect_uri", h.callbackUrl)
 	q.Add("response_mode", "form_post")
 	q.Add("scope", "openid")
 	q.Add("state", state)
 	q.Add("nonce", nonce)
+	q.Add("resource", fmt.Sprintf("spn:%s", h.clientId))
 	authUrl.RawQuery = q.Encode()
 
 	err = signInTemplate.Execute(writer, signInPageData{
@@ -118,6 +128,7 @@ func (h *AzureAuthenticationHandler) HandleAuthStart(writer http.ResponseWriter,
 }
 
 // TODO: on error should we simply redirect to an error page?
+// TODO: consume flash cookies at the very beginning?
 func (h *AzureAuthenticationHandler) HandleAuthCallback(writer http.ResponseWriter, request *http.Request) {
 	log.Printf("Callback, request: %+v", request)
 
@@ -135,6 +146,8 @@ func (h *AzureAuthenticationHandler) HandleAuthCallback(writer http.ResponseWrit
 		return
 	}
 
+	// TODO: check whether error response sill has this payload when using "code"
+
 	if authError, ok := request.Form["error"]; ok {
 		// TODO: check array length both for error and description
 		errorMsg := authError[0]
@@ -151,13 +164,54 @@ func (h *AzureAuthenticationHandler) HandleAuthCallback(writer http.ResponseWrit
 
 	log.Printf("Callback, request form: %+v", request.Form)
 
-	token, ok := request.Form["id_token"]
-	if !ok || len(token) != 1 {
-		http.Error(writer, "JWT not found", http.StatusBadRequest)
+	code, ok := request.Form["code"]
+	if !ok || len(code) != 1 {
+		http.Error(writer, "code not found", http.StatusBadRequest)
 		return
 	}
 
-	idToken, err := h.tokenVerifier.Verify(context.Background(), token[0])
+	resp, err := h.httpClient.PostForm(h.oidcProvider.Endpoint().TokenURL, url.Values{
+		"code": {code[0]},
+		"client_id": {h.clientId},
+		"client_secret": {h.clientSecret},
+		"redirect_uri": {h.callbackUrl},
+		"grant_type": {"authorization_code"},
+		"scope": {"profile group openid"},
+		"api-version": {"1.0"},
+	})
+	if err != nil {
+		http.Error(
+			writer,
+			fmt.Sprintf("error obtaining token"),
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	log.Printf("resp: %+v", resp)
+
+	defer resp.Body.Close()
+
+	var tokenResponse struct {
+		AccessToken string `json:"access_token"`
+		IdToken string `json:"id_token"`
+		ExpiresIn string `json:"expires_in"`
+		RefreshToken string `json:"refresh_token"`
+	}
+
+	if err = json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
+		log.Printf(err.Error())
+		http.Error(
+			writer,
+			fmt.Sprintf("error obtaining token"),
+			http.StatusInternalServerError,
+		)
+		return
+	}
+
+	log.Printf("Token: %v", tokenResponse.IdToken)
+
+	idToken, err := h.tokenVerifier.Verify(context.Background(), tokenResponse.IdToken)
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
@@ -175,7 +229,7 @@ func (h *AzureAuthenticationHandler) HandleAuthCallback(writer http.ResponseWrit
 
 	session := getSession(request)
 
-	err = validateState(request, session)
+	err = h.validateState(request, session)
 	if err != nil {
 		http.Error(writer, "cannot validate state", http.StatusBadRequest)
 		return
@@ -196,7 +250,8 @@ func (h *AzureAuthenticationHandler) HandleAuthCallback(writer http.ResponseWrit
 		return
 	}
 
-	h.userTokens[userKey] = token[0]
+	// IdToken does not have the 'spn:' prefix on the audience field; AccessToken does.
+	h.userTokens[userKey] = tokenResponse.AccessToken
 
 	// TODO: we might want to consider storing the redirect URL instead of always redirecting to /
 	http.Redirect(writer, request, "/", 302)
@@ -206,7 +261,7 @@ func (h *AzureAuthenticationHandler) HandleAuthCallback(writer http.ResponseWrit
 //  that the state and nonce values
 //  appear anywhere in the flash value list?
 
-func validateState(request *http.Request, session sessions.Session) error {
+func (h *AzureAuthenticationHandler) validateState(request *http.Request, session sessions.Session) error {
 	originalState := session.Flashes("state")
 
 	if len(originalState) != 1 {
