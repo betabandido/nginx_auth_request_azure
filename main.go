@@ -67,6 +67,10 @@ func main() {
 		IdleTimeout: 120 * time.Second,
 	}
 
+	http.HandleFunc("/health", func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	})
+
 	http.HandleFunc("/oauth2/auth", handler.HandleAuth)
 	http.HandleFunc("/oauth2/start", handler.HandleAuthStart)
 	http.HandleFunc("/oauth2/callback", handler.HandleAuthCallback)
